@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# Llama 2 is licensed under the LLAMA 2 Community License,
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
@@ -14,11 +13,13 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+
 from torchtitan.models.norms import build_norm
+from torchtitan.train_spec import BaseModelArgs, ModelProtocol
 
 
 @dataclass
-class ModelArgs:
+class TransformerModelArgs(BaseModelArgs):
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
@@ -131,7 +132,7 @@ class Attention(nn.Module):
     Multi-head attention module.
 
     Args:
-        model_args (ModelArgs): Model configuration arguments.
+        model_args (TransformerModelArgs): Model configuration arguments.
 
     Attributes:
         n_kv_heads (int): Number of key and value heads.
@@ -145,7 +146,7 @@ class Attention(nn.Module):
 
     """
 
-    def __init__(self, model_args: ModelArgs):
+    def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.n_kv_heads = (
@@ -265,7 +266,7 @@ class TransformerBlock(nn.Module):
 
     Args:
         layer_id (int): Identifier for the layer.
-        model_args (ModelArgs): Model configuration arguments.
+        model_args (TransformerModelArgs): Model configuration arguments.
 
     Attributes:
         n_heads (int): Number of attention heads.
@@ -279,7 +280,7 @@ class TransformerBlock(nn.Module):
 
     """
 
-    def __init__(self, layer_id: int, model_args: ModelArgs):
+    def __init__(self, layer_id: int, model_args: TransformerModelArgs):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
@@ -332,15 +333,15 @@ class TransformerBlock(nn.Module):
         self.feed_forward.init_weights(self.weight_init_std)
 
 
-class Transformer(nn.Module):
+class Transformer(nn.Module, ModelProtocol):
     """
     Transformer Module
 
     Args:
-        model_args (ModelArgs): Model configuration arguments.
+        model_args (TransformerModelArgs): Model configuration arguments.
 
     Attributes:
-        model_args (ModelArgs): Model configuration arguments.
+        model_args (TransformerModelArgs): Model configuration arguments.
         vocab_size (int): Vocabulary size.
         n_layers (int): Number of layers in the model.
         tok_embeddings (ParallelEmbedding): Token embeddings.
@@ -351,7 +352,7 @@ class Transformer(nn.Module):
 
     """
 
-    def __init__(self, model_args: ModelArgs):
+    def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
@@ -379,7 +380,10 @@ class Transformer(nn.Module):
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
 
-    def init_weights(self):
+    def init_weights(
+        self,
+        buffer_device: Optional[torch.device] = None,
+    ):
         """
         [Note: On ``init_weights`` vs. ``reset_parameters``]
         Modules may define ``reset_parameters`` to initialize parameter values.
@@ -391,7 +395,8 @@ class Transformer(nn.Module):
         ``init_weights``. We only call it in the constructor of this
         ``Transformer`` root module to avoid reinitializing tensors.
         """
-        with torch.device(self.freqs_cis.device):
+        buffer_device = buffer_device or self.freqs_cis.device
+        with torch.device(buffer_device):
             self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
@@ -415,8 +420,9 @@ class Transformer(nn.Module):
         return precompute_freqs_cis(
             self.model_args.dim // self.model_args.n_heads,
             # Need to compute until at least the max token limit for generation
-            # (use 2x max sequence length to be safe)
-            self.model_args.max_seq_len * 2,
+            # TODO: explain in docs/composability.md why we removed the 2x
+            # relaxing in our CP enablement PR
+            self.model_args.max_seq_len,
             self.model_args.rope_theta,
         )
 
@@ -438,16 +444,16 @@ class Transformer(nn.Module):
             h = layer(h, self.freqs_cis)
 
         h = self.norm(h) if self.norm else h
-        output = self.output(h).float() if self.output else h
+        output = self.output(h) if self.output else h
         return output
 
     @classmethod
-    def from_model_args(cls, model_args: ModelArgs) -> "Transformer":
+    def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":
         """
-        Initialize a Transformer model from a ModelArgs object.
+        Initialize a Transformer model from a TransformerModelArgs object.
 
         Args:
-            model_args (ModelArgs): Model configuration arguments.
+            model_args (TransformerModelArgs): Model configuration arguments.
 
         Returns:
             Transformer: Transformer model.

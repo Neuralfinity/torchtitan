@@ -4,115 +4,115 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import pickle
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 import torch
-from torch.distributed.checkpoint.stateful import Stateful
-from torch.utils.data import IterableDataset
-
-from torchdata.stateful_dataloader import StatefulDataLoader
-
-from torchtitan.datasets.tokenizer import Tokenizer
-from torchtitan.logging import logger
 
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
+from torch.distributed.checkpoint.stateful import Stateful
+from torch.utils.data import IterableDataset
 
-# map from dataset name to a local directory, or
-# a dataset repository on the HF hub
-_supported_datasets = {
-    "c4_test": "test/assets/c4_test",
-    "c4": "allenai/c4",
+from torchtitan.dataloader import ParallelAwareDataloader
+from torchtitan.datasets.tokenizer import Tokenizer
+from torchtitan.logging import logger
+
+
+def _load_c4_dataset(dataset_path: str):
+    """Load C4 dataset with default configuration."""
+    return load_dataset(dataset_path, name="en", split="train", streaming=True)
+
+
+def _process_c4_text(sample: dict[str, Any]) -> str:
+    """Process C4 dataset sample text."""
+    return sample["text"]
+
+
+@dataclass
+class DatasetConfig:
+    path: str
+    loader: Callable
+    text_processor: Callable
+
+
+# Add your dataset here here - more information at docs/datasets.md
+DATASETS = {
+    "c4": DatasetConfig(
+        path="allenai/c4",
+        loader=_load_c4_dataset,
+        text_processor=_process_c4_text,
+    ),
+    "c4_test": DatasetConfig(
+        path="tests/assets/c4_test",
+        loader=lambda path: load_dataset(path, split="train"),
+        text_processor=_process_c4_text,
+    ),
 }
 
 
+def _validate_dataset(
+    dataset_name: str, dataset_path: str = None
+) -> tuple[str, Callable, Callable]:
+    """Validate dataset name and path."""
+    if dataset_name not in DATASETS:
+        raise ValueError(
+            f"Dataset {dataset_name} is not supported. "
+            f"Supported datasets are: {list(DATASETS.keys())}"
+        )
+
+    config = DATASETS[dataset_name]
+    path = dataset_path or config.path
+    logger.info(f"Preparing {dataset_name} dataset from {path}")
+    return path, config.loader, config.text_processor
+
+
 class HuggingFaceDataset(IterableDataset, Stateful):
-    """PyTorch Representation of the HuggingFace Dataset.
-
-    Args:
-        dataset_name (str): name of the dataset to load
-        dataset_path (Optional[str]):
-            Path to the dataset in the file system. If provided, data will be loaded
-            from this path instead of downloaded.
-        tokenizer (Tokenizer):
-            Tokenizer used to encode data. Tokenize must implement an `encode` and `decode` method.
-        seq_len (int): max sequence length
-        world_size (int): number of data parallel processes participating in training
-        rank (int): rank of the current data parallel process
-        infinite (bool): whether to loop infinitely over the dataset
-
-    We currently support the c4 dataset, and a subset of it for testing purposes:
-    c4_test (2K training entries)
-    c4 (177M training entries - this dataset is streamed due to the size)
-
-    >> c4 (EN) <<:
-    c4 cleaned, English version
-    Data input format (c4):
-    {
-    'url': 'https://klyq.com/beginners-bbq-class-taking-place-in-missoula/',
-    'text': 'Beginners BBQ Class Taking Place in Missoula!\nDo you want to get better at ...',
-    'timestamp': '2019-04-25T12:57:54Z'
-    }
-
-    Example use (c4):
-    >>> ds = HuggingFaceDataset(dataset_name="c4", dataset_path=None, tokenizer=tokenizer)
-    >>> for batch in Dataloader(ds, batch_size=8):
-            print(f"Batch size: {len(batch)}")
-        Batch size: 8
-    """
-
     def __init__(
         self,
         dataset_name: str,
         dataset_path: Optional[str],
         tokenizer: Tokenizer,
         seq_len: int = 2048,
-        world_size: int = 1,
-        rank: int = 0,
+        dp_rank: int = 0,
+        dp_world_size: int = 1,
         infinite: bool = False,
     ) -> None:
-        # allow user to pass in a (local or HF hub) path to use unsupported datasets
-        if dataset_name not in _supported_datasets:
-            if dataset_path:
-                logger.warning(
-                    f"Dataset {dataset_name} is not tested or verfied. "
-                    f"Recommended datasets are: {list(_supported_datasets.keys())}"
-                )
-            else:
-                raise ValueError(
-                    f"Dataset {dataset_name} is not supported. "
-                    f"Supported datasets are: {list(_supported_datasets.keys())}"
-                )
+        # Force lowercase for consistent comparison
+        dataset_name = dataset_name.lower()
 
-        if not dataset_path:
-            dataset_path = _supported_datasets[dataset_name]
-        logger.info(f"Preparing {dataset_name} dataset from {dataset_path}")
+        path, dataset_loader, text_processor = _validate_dataset(
+            dataset_name, dataset_path
+        )
+        ds = dataset_loader(path)
 
-        if dataset_name == "c4":
-            # c4 is huge, and requires both streaming and language selection
-            # (we default to en)
-            ds = load_dataset(dataset_path, name="en", split="train", streaming=True)
-        else:
-            ds = load_dataset(dataset_path, split="train")
-
-        # TODO: support shuffling
         self.dataset_name = dataset_name
-        self._data = split_dataset_by_node(ds, rank, world_size)
+        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
+        self._text_processor = text_processor
 
-        # variables for checkpointing
+        # Variables for checkpointing
         self._sample_idx = 0
-        self._all_tokens: List[int] = []
+        self._all_tokens: list[int] = []
+
+    def _get_data_iter(self):
+        if isinstance(self._data, Dataset) and self._sample_idx == len(self._data):
+            return iter([])
+
+        it = iter(self._data)
+        for _ in range(self._sample_idx):
+            next(it)
+        return it
 
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
 
         while True:
             for sample in self._get_data_iter():
-                sample_text = sample["text"]
+                # Use the dataset-specific text processor
+                sample_text = self._text_processor(sample)
                 sample_tokens = self._tokenizer.encode(sample_text, bos=True, eos=True)
                 self._all_tokens.extend(sample_tokens)
                 self._sample_idx += 1
@@ -133,16 +133,6 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 self._sample_idx = 0
                 logger.warning(f"Dataset {self.dataset_name} is being re-looped")
 
-    def _get_data_iter(self):
-        if self._sample_idx == 0:
-            return iter(self._data)
-
-        # As skipping to the end throws an error in case of map-style dataset, return an empty iterator
-        if isinstance(self._data, Dataset) and self._sample_idx == len(self._data):
-            return iter([])
-
-        return iter(self._data.skip(self._sample_idx))
-
     def load_state_dict(self, state_dict):
         self._sample_idx = state_dict["sample_idx"]
         self._all_tokens = state_dict["token_buffer"]
@@ -151,45 +141,31 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         return {"token_buffer": self._all_tokens, "sample_idx": self._sample_idx}
 
 
-class DPAwareDataLoader(StatefulDataLoader, Stateful):
-    """
-    A wrapper around the StatefulDataLoader that ensures that the state is stored only once per DP rank.
-    """
-
-    def __init__(self, dp_rank: int, hf_ds: IterableDataset, batch_size: int):
-        super().__init__(hf_ds, batch_size)
-        self._dp_rank = dp_rank
-        self._rank_id = f"dp_rank_{dp_rank}"
-
-    def state_dict(self) -> Dict[str, Any]:
-        # Store state only for dp rank to avoid replicating the same state across other dimensions
-        return {self._rank_id: pickle.dumps(super().state_dict())}
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        # State being empty is valid
-        if not state_dict:
-            return
-
-        if self._rank_id not in state_dict:
-            logger.warning(
-                f"DataLoader state is empty for dp rank {self._dp_rank}, expected key {self._rank_id}"
-            )
-            return
-        super().load_state_dict(pickle.loads(state_dict[self._rank_id]))
-
-
-def build_hf_data_loader(
+def build_hf_dataloader(
     dataset_name: str,
     dataset_path: Optional[str],
     tokenizer: Tokenizer,
     batch_size: int,
     seq_len: int,
-    world_size,
-    rank,
+    dp_rank: int,
+    dp_world_size: int,
     infinite: bool = True,
-):
+) -> ParallelAwareDataloader:
+    """Build a data loader for HuggingFace datasets."""
+
     hf_ds = HuggingFaceDataset(
-        dataset_name, dataset_path, tokenizer, seq_len, world_size, rank, infinite
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        infinite=infinite,
     )
 
-    return DPAwareDataLoader(rank, hf_ds, batch_size=batch_size)
+    return ParallelAwareDataloader(
+        dataset=hf_ds,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        batch_size=batch_size,
+    )

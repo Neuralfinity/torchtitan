@@ -26,7 +26,20 @@ TORCH_DTYPE_MAP = {
 
 
 def string_list(raw_arg):
-    return raw_arg.split(",")
+    """Comma-separated string list argument."""
+    return [s.strip() for s in raw_arg.split(",") if s.strip()]
+
+
+def check_string_list_argument(args_dict: dict[str, any], fullargname: str):
+    section, name = fullargname.split(".")
+    # Split string list which are still raw strings.
+    if (
+        section in args_dict
+        and name in args_dict[section]
+        and isinstance(args_dict[section][name], str)
+    ):
+        sec = args_dict[section]
+        sec[name] = string_list(sec[name])
 
 
 class JobConfig:
@@ -52,6 +65,7 @@ class JobConfig:
     """
 
     def __init__(self):
+        self.args_dict = None
         # main parser
         self.parser = argparse.ArgumentParser(description="torchtitan arg parser.")
 
@@ -77,9 +91,13 @@ class JobConfig:
         )
         self.parser.add_argument(
             "--job.use_for_integration_test",
-            default=False,
             action="store_true",
             help="Add this config to the integration test suite",
+        )
+        self.parser.add_argument(
+            "--job.print_args",
+            action="store_true",
+            help="Print the args to terminal",
         )
 
         # profiling configs
@@ -103,7 +121,6 @@ class JobConfig:
         self.parser.add_argument(
             "--profiling.enable_memory_snapshot",
             action="store_true",
-            default=False,
             help="Whether to dump memory snapshot",
         )
         self.parser.add_argument(
@@ -121,15 +138,14 @@ class JobConfig:
             help="How often to log metrics to TensorBoard, in iterations",
         )
         self.parser.add_argument(
-            "--metrics.enable_color_printing",
-            default=False,
-            action="store_true",
-            help="Whether to enable color printing",
-        )
-        self.parser.add_argument(
             "--metrics.enable_tensorboard",
             action="store_true",
             help="Whether to log metrics to TensorBoard",
+        )
+        self.parser.add_argument(
+            "--metrics.disable_color_printing",
+            action="store_true",
+            help="Whether to disable color printing in logs",
         )
         self.parser.add_argument(
             "--metrics.save_tb_folder",
@@ -137,15 +153,21 @@ class JobConfig:
             default="tb",
             help="Folder to dump TensorBoard states",
         )
+        # TODO: store_true & default=True make impossible for cmd to set it to False
         self.parser.add_argument(
             "--metrics.rank_0_only",
-            default=True,
             action="store_true",
+            default=True,
             help="""
                 Whether to save TensorBoard metrics only for rank 0 or for all ranks.
                 When pipeline_parallel_degree is > 1, this option uses the 0th rank of the last stage pipeline group,
                 which is the only stage that computes loss metrics.
             """,
+        )
+        self.parser.add_argument(
+            "--metrics.enable_wandb",
+            action="store_true",
+            help="Whether to log metrics to Weights & Biases",
         )
 
         # model configs
@@ -165,13 +187,27 @@ class JobConfig:
             "--model.norm_type",
             type=str,
             default="rmsnorm",
-            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, fused_rmsnorm]",
+            choices=["layernorm", "np_layernorm", "rmsnorm"],
+            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm]",
         )
         self.parser.add_argument(
             "--model.tokenizer_path",
             type=str,
             default="./torchtitan/datasets/tokenizer/tokenizer.model",
             help="Tokenizer path",
+        )
+        self.parser.add_argument(
+            "--model.converters",
+            type=string_list,
+            nargs="+",
+            default=[],
+            help="""
+                Comma separated list of converters to apply to the model.
+
+                For instance, the `float8` converter swaps `torch.nn.Linear`
+                with `Float8Linear`. This feature requires you to install 'torchao'
+                which can be found here: https://github.com/pytorch/ao
+            """,
         )
 
         # optimizer configs
@@ -183,9 +219,16 @@ class JobConfig:
         )
         self.parser.add_argument(
             "--optimizer.fused",
-            default=False,
             action="store_true",
             help="Whether the fused implementation(CUDA only) is used.",
+        )
+        self.parser.add_argument(
+            "--optimizer.early_step_in_backward",
+            action="store_true",
+            help="""
+            Whether to apply optimizer in the backward. Caution, optimizer_in_backward
+            is not compatible with gradients clipping, users should not call
+            register_post_accumulate_grad_hook after the optimizer is built.""",
         )
 
         # training configs
@@ -249,9 +292,13 @@ class JobConfig:
             parallelism method used is FSDP (Fully Sharded Data Parallelism).
 
             -1 means leftover ranks will be used (After DP_REPLICATE/SP/PP). Note that
-            only one of `data_parallel_replicate_degree` and `data_parallel_shard_degree`
-            can be negative.
-            1 means disabled.""",
+            only `data_parallel_shard_degree` can be negative. 1 means disabled.""",
+        )
+        self.parser.add_argument(
+            "--training.enable_cpu_offload",
+            action="store_true",
+            help="""
+            Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP""",
         )
         self.parser.add_argument(
             "--training.tensor_parallel_degree",
@@ -260,14 +307,29 @@ class JobConfig:
             help="Tensor Parallelism degree. 1 means disabled.",
         )
         self.parser.add_argument(
-            "--training.enable_loss_parallel",
-            default=True,
+            "--training.disable_loss_parallel",
             action="store_true",
             help="Whether to apply loss parallel when sequence parallel is enabled",
         )
         self.parser.add_argument(
+            "--training.fsdp_reshard_after_forward",
+            type=str,
+            default="default",
+            choices=["default", "always", "never"],
+            help="""
+            `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
+            within an FSDP setup. `reshard_after_forward` controls parameter behavior after forward,
+            trading off memory and communication. See torch's `fully_shard` API for more documentation
+            on `reshard_after_forward`.
+            The supported policies include "default", "always" and "never":
+            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal
+              scenarios.
+            - "always" will enable `reshard_after_forward` for all forward passes.
+            - "never" will disable `reshard_after_forward` for all forward passes.
+            """,
+        )
+        self.parser.add_argument(
             "--experimental.enable_async_tensor_parallel",
-            default=False,
             action="store_true",
             help="Whether to apply async tensor parallel (currently only effective when compile is enabled)",
         )
@@ -299,16 +361,27 @@ class JobConfig:
         self.parser.add_argument(
             "--experimental.pipeline_parallel_schedule",
             type=str,
-            choices=["1f1b", "gpipe", "interleaved_1f1b", "flexible_interleaved_1f1b"],
-            default="1f1b",
+            default="1F1B",
             help="""
-                Specify the Pipeline Parallel schedule to use.
-
+                Specify the Pipeline Parallel schedule to use. The supported schedules are:
+                https://github.com/pytorch/pytorch/blob/de4c2a3b4e89d96334dc678d1c3f2ae51a6630a0/torch/distributed/pipelining/schedules.py#L2161.
                 The schedule must be compatible with the split points and stages_per_rank.
 
-                Looped schedules (e.g. interleaved_1f1b) require specifying pipeline_paralle_degree = number of ranks,
-                and split_points = number of stages - 1""",
+                Looped schedules (e.g. Interleaved1F1B) require specifying pipeline_parallel_degree = number of ranks,
+                and split_points = number of stages - 1
+                """,
         )
+        self.parser.add_argument(
+            "--experimental.pipeline_parallel_schedule_csv",
+            type=str,
+            default="",
+            help="""
+                Specify the path to the pipeline parallel schedule csv file to use.
+                The pipeline_parallel_schedule argument must be either
+                PipelineScheduleSingle, PipelineScheduleMulti, or _PipelineScheduleRuntime.
+            """,
+        )
+
         self.parser.add_argument(
             "--experimental.pipeline_parallel_microbatches",
             type=int,
@@ -327,13 +400,50 @@ class JobConfig:
             help="Enable CompiledAutograd to compile the backward.",
         )
         self.parser.add_argument(
+            "--experimental.context_parallel_degree",
+            type=int,
+            default=1,
+            help="Context parallelism degree. 1 means disabled.",
+        )
+        self.parser.add_argument(
+            "--experimental.context_parallel_rotate_method",
+            type=str,
+            default="allgather",
+            help="""
+                The collective to use in context parallel SDPA for kv shards exchange.
+
+                'allgather' means to all-gather all kv shards on ranks after the first sub-SDPA computation,
+
+                'alltoall' means to all-to-all shuffle the kv shards.
+
+                The default value is 'allgather'.
+            """,
+        )
+        # I'm not particularly fond of this. Users can choose to write their own wrapper
+        # module and import TorchTitan training loop and execute it, which look cleaner.
+        # One reason to provide this option is to allow users to use the existing run script.
+        # While the script is pretty trivial now, we may add more logic when integrating
+        # with TorchFT.
+        # This option is subject to change and may be deleted in the future.
+        self.parser.add_argument(
+            "--experimental.custom_model_path",
+            type=str,
+            default="",
+            help="""
+                The --custom_model_path option allows to specify a custom path to a model module
+                that is not natively implemented within TorchTitan.
+                Acceptable values are the file system path to the module (e.g., my_models/model_x)
+                dotted import module  (e.g., some_package.model_x).
+            """,
+        )
+        self.parser.add_argument(
             "--training.mixed_precision_param",
             type=str,
             default="bfloat16",
             choices=["bfloat16", "float32"],
             help="""
                 torch dtype to use for parameters when applying mixed precision via FSDP.
-                This feature only takes effect when data_parallel_degree > 1
+                This feature only takes effect when data_parallel_shard_degree > 1
             """,
         )
         self.parser.add_argument(
@@ -343,7 +453,7 @@ class JobConfig:
             choices=["float32"],
             help="""
                 torch dtype to use for reductions when applying mixed precision via FSDP.
-                This feature only takes effect when data_parallel_degree > 1
+                This feature only takes effect when data_parallel_shard_degree > 1
             """,
         )
         self.parser.add_argument(
@@ -361,7 +471,12 @@ class JobConfig:
             "--training.seed",
             type=int,
             default=None,
-            help="Implement reproducibility by setting a Python, PyTorch and CUDA seed",
+            help="Choose the base RNG seed used for training",
+        )
+        self.parser.add_argument(
+            "--training.deterministic",
+            action="store_true",
+            help="Use deterministic algorithms wherever possible, may be slower",
         )
         # checkpointing configs
         self.parser.add_argument(
@@ -451,7 +566,23 @@ class JobConfig:
                 0 is the default value.
             """,
         )
-
+        self.parser.add_argument(
+            "--checkpoint.load_step",
+            type=int,
+            default=-1,
+            help="Load the checkpoint at the specified step. If -1, load the latest checkpoint.",
+        )
+        self.parser.add_argument(
+            "--checkpoint.exclude_from_loading",
+            type=string_list,
+            nargs="*",
+            default=[],
+            help="""
+                Exclude specific keys from being loaded from the checkpoint.
+                Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader'.
+                This will load the model only, excluding the specified keys.
+            """,
+        )
         # activation checkpointing configs
         self.parser.add_argument(
             "--activation_checkpoint.mode",
@@ -471,44 +602,23 @@ class JobConfig:
 
         # float8 configs
         self.parser.add_argument(
-            "--float8.enable_float8_linear",
-            action="store_true",
-            help="""
-                If true, swaps `torch.nn.Linear` with `Float8Linear`.
-                This feature requires you to install 'torchao' which can be found
-                here: https://github.com/pytorch/ao
-            """,
-        )
-        self.parser.add_argument(
             "--float8.enable_fsdp_float8_all_gather",
             action="store_true",
-            default=False,
             help="Whether enable float8 all-gather in FSDP",
         )
         self.parser.add_argument(
             "--float8.precompute_float8_dynamic_scale_for_fsdp",
             action="store_true",
-            default=False,
             help="Whether precompute float8 scales dynamically for FSDP",
         )
         self.parser.add_argument(
-            "--float8.scaling_type_input",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-            choices=["dynamic", "delayed"],
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_weight",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_grad_output",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
+            "--float8.force_recompute_fp8_weight_in_bwd",
+            action="store_true",
+            help="""
+            Whether to force the recomputation of FP8 weights during backward pass.
+            When using FSDP, it is recommended to enable `force_recompute_fp8_weight_in_bwd`
+            to prevent saving unsharded FP8 weights for backward computation.
+            """,
         )
 
         # communications library settings
@@ -544,9 +654,11 @@ class JobConfig:
         self.parser.add_argument(
             "--memory_estimation.disable_fake_mode",
             help="Whether to estimate memory under FakeTensorMode",
-            default=False,
             action="store_true",
         )
+
+    def to_dict(self):
+        return self.args_dict
 
     def parse_args(self, args_list: list = sys.argv[1:]):
         args, cmd_args = self.parse_args_from_command_line(args_list)
@@ -566,11 +678,19 @@ class JobConfig:
                 logger.exception(f"Error details: {str(e)}")
                 raise e
 
+        # Checking string-list arguments are properly split into a list
+        # if split-points came from 'args' (from cmd line) it would have already been parsed into a list by that parser
+        string_list_argnames = self._get_string_list_argument_names()
+        for n in string_list_argnames:
+            check_string_list_argument(args_dict, n)
+
         # override args dict with cmd_args
         cmd_args_dict = self._args_to_two_level_dict(cmd_args)
         for section, section_args in cmd_args_dict.items():
             for k, v in section_args.items():
                 args_dict[section][k] = v
+
+        self.args_dict = args_dict
 
         for k, v in args_dict.items():
             class_type = type(k.title(), (), v)
@@ -590,6 +710,13 @@ class JobConfig:
         assert self.model.flavor
         assert self.model.tokenizer_path
 
+    def _get_string_list_argument_names(self) -> list[str]:
+        """Get the parser argument names of type `string_list`."""
+        string_list_args = [
+            v.dest for v in self.parser._actions if v.type is string_list
+        ]
+        return string_list_args
+
     def parse_args_from_command_line(
         self, args_list
     ) -> Tuple[argparse.Namespace, argparse.Namespace]:
@@ -597,6 +724,7 @@ class JobConfig:
         Parse command line arguments and return the parsed args and the command line only args
         """
         args = self.parser.parse_args(args_list)
+        string_list_argnames = set(self._get_string_list_argument_names())
 
         # aux parser to parse the command line only args, with no defaults from main parser
         aux_parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS)
@@ -605,7 +733,7 @@ class JobConfig:
                 aux_parser.add_argument(
                     "--" + arg, action="store_true" if val else "store_false"
                 )
-            elif arg == "experimental.pipeline_parallel_split_points":
+            elif arg in string_list_argnames:
                 # without this special case, type inference breaks here,
                 # since the inferred type is just 'list' and it ends up flattening
                 # e.g. from ["layers.0", "layers.1"] into ["l", "a", "y", "e", "r", "s", ".0", ...]

@@ -21,15 +21,16 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
-    get_optimizer_state_dict,
     set_model_state_dict,
-    set_optimizer_state_dict,
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import DataLoader
+
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging import init_logger, logger
+from torchtitan.optimizer import LRSchedulersContainer, OptimizersContainer
+from torchtitan.utils import GarbageCollection
 
 
 class IntervalType(enum.Enum):
@@ -98,37 +99,18 @@ class ModelWrapper(Stateful):
         list(map(func, self.model))
 
 
-class OptimizerWrapper(Stateful):
-    def __init__(
-        self,
-        model: Union[nn.Module, List[nn.Module]],
-        optim: Union[torch.optim.Optimizer, List[torch.optim.Optimizer]],
-    ) -> None:
-        self.model = [model] if isinstance(model, nn.Module) else model
-        self.optim = [optim] if isinstance(optim, torch.optim.Optimizer) else optim
-
-    def state_dict(self) -> Dict[str, Any]:
-        func = functools.partial(
-            get_optimizer_state_dict,
-            options=StateDictOptions(flatten_optimizer_state_dict=True),
-        )
-        return {k: v for sd in map(func, self.model, self.optim) for k, v in sd.items()}
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        func = functools.partial(
-            set_optimizer_state_dict,
-            optim_state_dict=state_dict,
-            options=StateDictOptions(flatten_optimizer_state_dict=True),
-        )
-        list(map(func, self.model, self.optim))
-
-
 class Terminate:
     pass
 
 
 class SaveDone:
     pass
+
+
+@torch.no_grad()
+def save_with_gc(state, checkpoint_id):
+    dcp.save(state, checkpoint_id=checkpoint_id)
+    GarbageCollection.collect("GC collection invoked by checkpointer.")
 
 
 def checkpoint_mp(recv, send):
@@ -150,7 +132,7 @@ def checkpoint_mp(recv, send):
             assert isinstance(obj, tuple)
             begin = time.monotonic()
             state, checkpoint_id = obj
-            dcp.save(state, checkpoint_id=checkpoint_id)
+            save_with_gc(state, checkpoint_id=checkpoint_id)
             logger.info(
                 "Finish saving the checkpoint in the background process in "
                 f"{time.monotonic() - begin:.2f} seconds."
@@ -165,8 +147,8 @@ class CheckpointManager:
         self,
         dataloader: DataLoader,
         model_parts: List[nn.Module],
-        optimizers: List[torch.optim.Optimizer],
-        lr_schedulers: List[torch.optim.lr_scheduler.LRScheduler],
+        optimizers: OptimizersContainer,
+        lr_schedulers: LRSchedulersContainer,
         states: Dict[str, Any],
         job_config: JobConfig,
     ) -> None:
@@ -186,7 +168,7 @@ class CheckpointManager:
         restore its optimizer states, others will error.
 
             The solution to this problem is optimizer flattening: it landed in #127071 and is enabled in TorchTitan
-            by passing the 'flatten_optimizer_state_dict' kwarg to DCP functions called in the OptimizerWrapper.
+            by passing the 'flatten_optimizer_state_dict' kwarg to DCP functions called in the OptimizerContainer.
 
         2. With complex PP schedules, we have multiple model chunks per pp rank. This compounds challenge (1) by also
         requiring us to reason about multiple 'optim' objects locally.
@@ -196,42 +178,19 @@ class CheckpointManager:
             which is gauranteed for the model by correct pipeline splitting and for the optimizer by the flattening
             support described in (1).
 
-        3. LR schedulers also index model states like optimizers and would need to be flattened properly to support
-        resharding.  Unfortunately, the implementations of different lr_schedulers do not follow a clear pattern like
-        optimizers do, so it's hard to write a generic 'flattener' utility.
-
-            TODO: This is currently unsolved and needs a fix.
+        3. LR schedulers also index model states like optimizers. Here we flatten the lr_schedulers with the assumption that
+        all lr_schedulers have the same state_dict.
         """
-        assert len(model_parts) == len(
-            optimizers
-        ), "Must pass one optimizer per model part"
-        assert len(model_parts) == len(
-            lr_schedulers
-        ), "Must pass one lr_scheduler per model part"
-
-        assert len(model_parts) == len(
-            optimizers
-        ), "Must pass one optimizer per model part"
-        assert len(model_parts) == len(
-            lr_schedulers
-        ), "Must pass one lr_scheduler per model part"
-
         self.states = states
 
         self.states.update(
             {
                 "model": ModelWrapper(model_parts),
-                "optimizer": OptimizerWrapper(model_parts, optimizers),
+                "optimizer": optimizers,
                 "dataloader": dataloader,
+                "lr_scheduler": lr_schedulers,
             }
         )
-        if len(lr_schedulers) == 1:
-            self.states["lr_scheduler"] = lr_schedulers[0]
-        else:
-            # For now, pipeline-parallel with looped schedules does not support resharding for lr_scheduler.
-            # It should only support saving and loading a distributed checkpoint with the same number of pp ranks
-            for idx, lr_scheduler in enumerate(lr_schedulers):
-                self.states[f"lr_scheduler_{idx}"] = lr_scheduler
 
         self.folder = os.path.join(job_config.job.dump_folder, ckpt_config.folder)
         self.interval_type = (
@@ -243,13 +202,15 @@ class CheckpointManager:
         self.begin_time = 0
         self.time_sync_work = None
         self.time_sync_result = None
-        self.pg = dist.new_group(backend="gloo")
+        async_mode = ckpt_config.async_mode.lower()
+        if async_mode == AsyncMode.ASYNC or self.interval_type == IntervalType.SECONDS:
+            self.pg = dist.new_group(backend="gloo")
 
         self.model_weights_only = ckpt_config.model_weights_only
         self.export_dtype = TORCH_DTYPE_MAP[ckpt_config.export_dtype]
+        self.exclude_from_loading = ckpt_config.exclude_from_loading
 
         self.mp = None
-        async_mode = ckpt_config.async_mode.lower()
         if async_mode == AsyncMode.DISABLED:
             self.async_mode = AsyncMode.DISABLED
         elif async_mode == AsyncMode.ASYNC:
@@ -271,7 +232,6 @@ class CheckpointManager:
             self.mp.start()
             self.cpu_offload_state_dict = None
             self.staging = False
-            self.staging_state_dict = None
             self.staging_id = None
             self.staging_stream = torch.cuda.Stream()
         else:
@@ -321,7 +281,7 @@ class CheckpointManager:
         else:
             logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
 
-        dcp.save(self.states, checkpoint_id=self._create_checkpoint_id(curr_step))
+        save_with_gc(self.states, checkpoint_id=self._create_checkpoint_id(curr_step))
         self.reset()
 
     def _should_save(self, curr_step: int, force: bool = False) -> bool:
@@ -384,7 +344,7 @@ class CheckpointManager:
         if self.cpu_offload_state_dict is None:
             logger.debug(f"Preparing the CPU memory, {time.monotonic()=}.:.2f")
             self.cpu_offload_state_dict = _create_cpu_state_dict(
-                state_dict, pin_memory=True
+                state_dict, pin_memory=True, share_memory=True
             )
 
         logger.debug(f"Staging the state_dict, {time.monotonic()=}.:.2f")
@@ -395,7 +355,6 @@ class CheckpointManager:
                 non_blocking=True,
             )
             self.staging = True
-            self.staging_state_dict = state_dict
             self.staging_id = checkpoint_id
 
     def save(self, curr_step: int, force: bool = False) -> None:
@@ -411,16 +370,21 @@ class CheckpointManager:
         begin = time.monotonic()
         checkpoint_id = self._create_checkpoint_id(curr_step)
         self._async_wait()
+        # This GC is called for async checkpoint as it is useless to do
+        # GC right after async_save -- the CPU memory is not able to be
+        # freed until _async_wait()
         if force:
             self._save_last_step(curr_step)
         elif self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+            GarbageCollection.collect("GC collection invoked by checkpointer.")
             self._async_with_pinned_memory(checkpoint_id)
         elif self.async_mode == AsyncMode.ASYNC:
+            GarbageCollection.collect("GC collection invoked by checkpointer.")
             self.async_future = dcp.async_save(
                 self.states, checkpoint_id=checkpoint_id, process_group=self.pg
             )
         else:
-            dcp.save(self.states, checkpoint_id=checkpoint_id)
+            save_with_gc(self.states, checkpoint_id=checkpoint_id)
         self.reset()
         self._purge_stale_checkpoints()
 
@@ -435,12 +399,19 @@ class CheckpointManager:
             and self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
             and self.staging
         ):
-            logger.debug(f"Waiting for staging, {time.monotonic()=:.2f}.")
-            self.staging_stream.synchronize()
-            logger.debug(
-                f"Sending the state dict to the background process, {time.monotonic()=:.2f}."
-            )
-            self.mp_queue_send.put((self.staging_state_dict, self.staging_id))
+            if not self.staging_stream.query():
+                self.staging_stream.synchronize()
+
+            def sync_func():
+                self.mp_queue_send.put_nowait(
+                    (self.cpu_offload_state_dict, self.staging_id)
+                )
+
+            # This may be a faster way to do zero-overhead checkpointing staging
+            # checkpointing but we need more thorough investigation before
+            # swithing to this method.
+            # self.my_thread = threading.Thread(target=func).start()
+            sync_func()
             self.staging = False
 
     def load(self, step: int = -1) -> bool:
@@ -464,15 +435,35 @@ class CheckpointManager:
 
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
+        # PyTorch bug: (pytorch/pytorch#138575)
+        # dcp.load() replaces the values of stateful elements in `states` with new objects
+        # from loading the checkpoint, in addition to updating the states of the original
+        # objects from `states` in-place. This is a problem because the state_dict no longer
+        # refers to the objects being used in the train loop, meaning any future checkpoints
+        # will not include updates to these objects (such as updated optimizer states, etc.)
+        original_stateful_states = {
+            k: v for k, v in states.items() if isinstance(v, Stateful)
+        }
         logger.info(f"Loading the checkpoint at step {step}.")
         begin = time.monotonic()
+        states_to_load = {
+            k: v for k, v in states.items() if k not in self.exclude_from_loading
+        }
+        for exclude_key in self.exclude_from_loading:
+            if exclude_key not in states:
+                raise ValueError(f"{exclude_key} not found in state_dict.")
         dcp.load(
-            states,
+            states_to_load,
             checkpoint_id=self._create_checkpoint_id(step),
         )
+        states.update(states_to_load)
         logger.info(
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
         )
+        # bugfix from above: restore the original stateful objects,
+        # whose states were already updated in-place by dcp.load()
+        states.update(original_stateful_states)
+        GarbageCollection.collect("GC collection for checkpoint loading.")
         return True
 
     def _purge_stale_checkpoints(self):

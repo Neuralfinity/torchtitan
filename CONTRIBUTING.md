@@ -58,21 +58,11 @@ It is the contributor’s responsibility to justify the change. The requirements
 
 #### Loss
 
-- If a change does not impact computation results, one should see identical loss before vs. after, with fixed random seeds. An example is activation checkpointing.
-```
-seed = 0
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-```
-- If a change is expected to impact computation results, loss convergence should be verified via end-to-end training on representable datasets (e.g. Llama3 models on the C4 dataset). One can refer to the example jobs reported in [performance.md](docs/performance.md) on what configs and how many steps to run.
-- The resulted loss curve should be compared with a verified baseline.
-  - 1D FSDP – Preferred, whose effectiveness can be proven by comparing with 1D DDP and single-GPU training.
-  - 2D FSDP + TP can be used as the baseline when 1D FSDP does not suffice to make comparisons due to limited scalability. For example, this should be the baseline when experimenting with 3D parallelisms on the Llama 3.1 405B model.
+- If a change does not impact computation results, one should see identical loss before vs. after, with fixed random seeds (`training.seed`) and deterministic algorithms (`training.deterministic`). An example is activation checkpointing.
+- If a change is expected to impact computation results, loss converging should be verified via end-to-end training on representable datasets (e.g. Llama 3 models on the C4 dataset). Please refer to the recommended practices in [converging.md](docs/converging.md).
 
 #### Performance
-- Memory and WPS / MFU, which are available from logging, should meet expectations.
+- Memory and TPS / MFU, which are available from logging, should meet expectations.
 - It is worth noting that performance expectations vary from case to case. For example, there are cases when a technique targeting memory reduction may cause throughput regression but still be acceptable (e.g. activation checkpointing). Again, it is the contributor's job to justify the feature, whether by achieving hypothetical performance, or by comparing with existing well-known implementations, etc.
 - If necessary, verify the numbers on jobs spanning multiple nodes (e.g. on 64 GPUs). Please reach out to the `torchtitan` team for help if you are resource-constrained.
 - When appropriate, one should show profile traces and/or memory snapshots to prove the effectiveness.
@@ -82,9 +72,9 @@ torch.backends.cudnn.benchmark = False
 When appropriate, one should consider
 
 - Adding CPU/GPU unit/integration tests.
-  - To add a unit test, put it in the [test](test/) folder and follow the existing test files.
-  - To add a GPU integration test, create a new `OverrideDefinitions` in [test_runner.py](test_runner.py). It will override the default config to run on the [debug model](train_configs/debug_model.toml).
+  - To add a unit test, put it in the [tests](tests/) folder and follow the existing test files.
+  - To add a GPU integration test, create a new `OverrideDefinitions` in [integration_tests.py](tests/integration_tests.py). It will override the default config to run on the [debug model](train_configs/debug_model.toml).
 - Updating [README](README.md) and writing a new note in the [docs](docs/) folder on installation and usage, similar to [float8.md](docs/float8.md).
 - Updating [performance.md](docs/performance.md) with new performance results.
 - Creating GitHub issues for things that cannot be addressed at the moment.
-- Writing a post on [PyTorch Dev Discussions](https://dev-discuss.pytorch.org/c/distributed/6) forum and linking to it.
+- Writing a post on [PyTorch Forums](https://discuss.pytorch.org/c/distributed/torchtitan/44) and linking to it.

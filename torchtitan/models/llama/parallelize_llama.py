@@ -11,8 +11,13 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
+
 from torch.distributed import DeviceMesh
-from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed._composable.fsdp import (
+    CPUOffloadPolicy,
+    fully_shard,
+    MixedPrecisionPolicy,
+)
 from torch.distributed._composable.replicate import replicate
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -28,8 +33,7 @@ from torch.distributed.tensor.parallel import (
 
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging import logger
-from torchtitan.parallelisms.parallel_dims import ParallelDims
-from torchtitan.parallelisms.utils import check_strided_sharding_enabled
+from torchtitan.parallelisms import ParallelDims
 
 
 def parallelize_llama(
@@ -52,11 +56,12 @@ def parallelize_llama(
             and not job_config.training.compile
         ):
             raise RuntimeError("Async TP requires --training.compile")
+        enable_float8_linear = "float8" in job_config.model.converters
         apply_tp(
             model,
             world_mesh["tp"],
             loss_parallel=parallel_dims.loss_parallel_enabled,
-            enable_float8=job_config.float8.enable_float8_linear,
+            enable_float8=enable_float8_linear,
             enable_async_tp=job_config.experimental.enable_async_tensor_parallel,
         )
 
@@ -65,43 +70,45 @@ def parallelize_llama(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if job_config.training.compile:
-        if job_config.model.norm_type == "fused_rmsnorm":
-            raise NotImplementedError(
-                "fused_rmsnorm is not compatible with torch.compile yet. "
-                "Please use rmsnorm or layernorm."
-            )
         apply_compile(model)
 
-    if parallel_dims.dp_enabled:
-        if parallel_dims.dp_shard_enabled:
-            if parallel_dims.dp_replicate_enabled:
-                dp_mesh = world_mesh["dp_replicate", "dp_shard"]
-            else:
-                dp_mesh = world_mesh["dp"]
-
-            apply_fsdp(
-                model,
-                dp_mesh,
-                param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
-                reduce_dtype=TORCH_DTYPE_MAP[
-                    job_config.training.mixed_precision_reduce
-                ],
-                tp_enabled=parallel_dims.tp_enabled,
-                pp_enabled=parallel_dims.pp_enabled,
-            )
-            if parallel_dims.dp_replicate_enabled:
-                logger.info("Applied HSDP to the model")
-            else:
-                logger.info("Applied FSDP to the model")
+    if (
+        parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled
+    ):  # apply FSDP or HSDP, potentially with Context Parallel
+        if parallel_dims.dp_replicate_enabled:
+            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
-            if world_mesh.ndim > 1:
-                raise RuntimeError("DDP has not supported > 1D parallelism")
-            apply_ddp(
-                model,
-                world_mesh,
-                enable_compile=job_config.training.compile,
-                enable_compiled_autograd=job_config.experimental.enable_compiled_autograd,
-            )
+            dp_mesh_dim_names = ("dp_shard_cp",)
+
+        apply_fsdp(
+            model,
+            world_mesh[tuple(dp_mesh_dim_names)],
+            param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=job_config.training.enable_cpu_offload,
+            reshard_after_forward_policy=job_config.training.fsdp_reshard_after_forward,
+        )
+
+        if parallel_dims.dp_replicate_enabled:
+            logger.info("Applied HSDP to the model")
+        else:
+            logger.info("Applied FSDP to the model")
+
+        if parallel_dims.cp_enabled:
+            logger.info("Applied Context Parallel to the model")
+
+        if job_config.training.enable_cpu_offload:
+            logger.info("Applied CPU Offloading to the model")
+    elif parallel_dims.dp_replicate_enabled:
+        if world_mesh.ndim > 1:
+            raise RuntimeError("DDP has not supported > 1D parallelism")
+        apply_ddp(
+            model,
+            world_mesh,
+            enable_compile=job_config.training.compile,
+            enable_compiled_autograd=job_config.experimental.enable_compiled_autograd,
+        )
 
 
 def apply_tp(
@@ -206,6 +213,10 @@ _save_list = {
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
+    # for low precision training, it's useful to always save
+    # the result of max, since the absolute maximum is
+    # used to compute the scaling factor for quantization.
+    torch.ops.aten.max.default,
 }
 
 
@@ -297,30 +308,50 @@ def apply_fsdp(
     dp_mesh: DeviceMesh,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
-    tp_enabled: bool,
     pp_enabled: bool,
+    cpu_offload: bool = False,
+    reshard_after_forward_policy: str = "default",
 ):
     """
-    Apply data parallelism to the model. FSDP2 is used here.
+    Apply data parallelism (via FSDP2) to the model.
+
+    Args:
+        model (nn.Module): The model to apply data parallelism to.
+        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
+        param_dtype (torch.dtype): The data type to use for model parameters.
+        reduce_dtype (torch.dtype): The data type to use for reduction operations.
+        pp_enabled (bool): Whether pipeline parallelism is enabled.
+        cpu_offload (bool, optional): Whether to offload model parameters to CPU. Defaults to False.
+        reshard_after_forward_policy (str, optional): The policy to use for resharding after forward pass. Defaults to "default".
+            Other options: "never", "always".
+            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
+            - "always" will enable `reshard_after_forward` for all forward passes.
+            - "never" will disable `reshard_after_forward` for all forward passes.
+
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
-
-    # TODO: remove this check once PyTorch 2.5 is released. We can safely assume
-    # that users won't use a nightly build which is older than 20240809 by then.
-    if tp_enabled:
-        # check if strided sharding is enabled, which is necessary for 2D/3D DCP
-        check_strided_sharding_enabled()
+    if cpu_offload:
+        fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
     for layer_id, transformer_block in model.layers.items():
-        if pp_enabled:
-            # For PP, do not reshard after forward to avoid per-microbatch
-            # all-gathers, which can be expensive and non-overlapped
+        if reshard_after_forward_policy == "always":
+            reshard_after_forward = True
+        elif reshard_after_forward_policy == "never":
             reshard_after_forward = False
+        elif reshard_after_forward_policy == "default":
+            if pp_enabled:
+                # For PP, do not reshard after forward to avoid per-microbatch
+                # all-gathers, which can be expensive and non-overlapped
+                reshard_after_forward = False
+            else:
+                # As an optimization, do not reshard after forward for the last
+                # transformer block since FSDP would prefetch it immediately
+                reshard_after_forward = int(layer_id) < len(model.layers) - 1
         else:
-            # As an optimization, do not reshard after forward for the last
-            # transformer block since FSDP would prefetch it immediately
-            reshard_after_forward = int(layer_id) < len(model.layers) - 1
+            raise ValueError(
+                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
+            )
         fully_shard(
             transformer_block,
             **fsdp_config,
